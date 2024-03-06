@@ -17,125 +17,211 @@
 
 from absl import logging
 import numpy as np
-import sonnet as snt
-import tensorflow.compat.v1 as tf
-import tensorflow_probability as tfp
+# import sonnet as snt
+# import tensorflow.compat.v1 as tf
+# import tensorflow_probability as tfp
 
 from curl import layers
 from curl import utils
 
-tfc = tf.compat.v1
-
+# tfc = tf.compat.v1
+from torch import nn
+import torch.nn.functional as F
+import torch
 # pylint: disable=g-long-lambda
 # pylint: disable=redefined-outer-name
 
+class SharedEncoder(nn.Module):
+    """The shared encoder module, mapping input x to hiddens."""
 
-class SharedEncoder(snt.AbstractModule):
-  """The shared encoder module, mapping input x to hiddens."""
+    def __init__(self, encoder_type, n_enc, enc_strides):
+        """The shared encoder function, mapping input x to hiddens.
 
-  def __init__(self, encoder_type, n_enc, enc_strides, name='shared_encoder'):
-    """The shared encoder function, mapping input x to hiddens.
+        Args:
+          encoder_type: str, type of encoder, either 'conv' or 'multi'
+          n_enc: list, number of hidden units per layer in the encoder
+          enc_strides: list, stride in each layer (only for 'conv' encoder_type)
+        """
+        super(SharedEncoder, self).__init__()
+        self._encoder_type = encoder_type
+        self.shared_encoder = None
+        self.mlp_shared_encoder = None
 
-    Args:
-      encoder_type: str, type of encoder, either 'conv' or 'multi'
-      n_enc: list, number of hidden units per layer in the encoder
-      enc_strides: list, stride in each layer (only for 'conv' encoder_type)
-      name: str, module name used for tf scope.
-    """
-    super(SharedEncoder, self).__init__(name=name)
-    self._encoder_type = encoder_type
+        if encoder_type == 'conv':
+            self.shared_encoder = layers.SharedConvModule(
+                filters=n_enc,
+                strides=enc_strides,
+                kernel_size=3,
+                activation=nn.ReLU())
+        elif encoder_type == 'multi':
+            layers = [nn.Flatten()]
+            for i in range(len(n_enc) - 1):
+                layers.extend([
+                    nn.Linear(in_features=n_enc[i], out_features=n_enc[i + 1]),
+                    nn.ReLU(),
+                ])
+            self.mlp_shared_encoder = nn.Sequential(*layers)
+        else:
+            raise ValueError('Unknown encoder_type {}'.format(encoder_type))
 
-    if encoder_type == 'conv':
-      self.shared_encoder = layers.SharedConvModule(
-          filters=n_enc,
-          strides=enc_strides,
-          kernel_size=3,
-          activation=tf.nn.relu)
-    elif encoder_type == 'multi':
-      self.shared_encoder = snt.nets.MLP(
-          name='mlp_shared_encoder',
-          output_sizes=n_enc,
-          activation=tf.nn.relu,
-          activate_final=True)
-    else:
-      raise ValueError('Unknown encoder_type {}'.format(encoder_type))
+    def forward(self, x):
+        if self._encoder_type == 'multi':
+            return self.mlp_shared_encoder(x)
+        else:
+            output = self.shared_encoder(x)
+            self.conv_shapes = self.shared_encoder.conv_shapes
+            return output
 
-  def _build(self, x, is_training):
-    if self._encoder_type == 'multi':
-      self.conv_shapes = None
-      x = snt.BatchFlatten()(x)
-      return self.shared_encoder(x)
-    else:
-      output = self.shared_encoder(x)
-      self.conv_shapes = self.shared_encoder.conv_shapes
-      return output
+# class SharedEncoder(snt.AbstractModule):
+#   """The shared encoder module, mapping input x to hiddens."""
 
+#   def __init__(self, encoder_type, n_enc, enc_strides, name='shared_encoder'):
+#     """The shared encoder function, mapping input x to hiddens.
 
-def cluster_encoder_fn(hiddens, n_y_active, n_y, is_training=True):
-  """The cluster encoder function, modelling q(y | x).
+#     Args:
+#       encoder_type: str, type of encoder, either 'conv' or 'multi'
+#       n_enc: list, number of hidden units per layer in the encoder
+#       enc_strides: list, stride in each layer (only for 'conv' encoder_type)
+#       name: str, module name used for tf scope.
+#     """
+#     super(SharedEncoder, self).__init__(name=name)
+#     self._encoder_type = encoder_type
 
-  Args:
-    hiddens: The shared encoder activations, 2D `Tensor` of size `[B, ...]`.
-    n_y_active: Tensor, the number of active components.
-    n_y: int, number of maximum components allowed (used for tensor size)
-    is_training: Boolean, whether to build the training graph or an evaluation
-      graph.
+#     if encoder_type == 'conv':
+#       self.shared_encoder = layers.SharedConvModule(
+#           filters=n_enc,
+#           strides=enc_strides,
+#           kernel_size=3,
+#           activation=tf.nn.relu)
+#     elif encoder_type == 'multi':
+#       self.shared_encoder = snt.nets.MLP(
+#           name='mlp_shared_encoder',
+#           output_sizes=n_enc,
+#           activation=tf.nn.relu,
+#           activate_final=True)
+#     else:
+#       raise ValueError('Unknown encoder_type {}'.format(encoder_type))
 
-  Returns:
-    The distribution `q(y | x)`.
-  """
-  del is_training  # unused for now
-  with tf.control_dependencies([tfc.assert_rank(hiddens, 2)]):
-    lin = snt.Linear(n_y, name='mlp_cluster_encoder_final')
-    logits = lin(hiddens)
-
-  # Only use the first n_y_active components, and set the remaining to zero.
-  if n_y > 1:
-    probs = tf.nn.softmax(logits[:, :n_y_active])
-    logging.info('Cluster softmax active probs shape: %s', str(probs.shape))
-    paddings1 = tf.stack([tf.constant(0), tf.constant(0)], axis=0)
-    paddings2 = tf.stack([tf.constant(0), n_y - n_y_active], axis=0)
-    paddings = tf.stack([paddings1, paddings2], axis=1)
-    probs = tf.pad(probs, paddings) + 0.0 * logits + 1e-12
-  else:
-    probs = tf.ones_like(logits)
-  logging.info('Cluster softmax probs shape: %s', str(probs.shape))
-
-  return tfp.distributions.OneHotCategorical(probs=probs)
+#   def _build(self, x, is_training):
+#     if self._encoder_type == 'multi':
+#       self.conv_shapes = None
+#       x = snt.BatchFlatten()(x)
+#       return self.shared_encoder(x)
+#     else:
+#       output = self.shared_encoder(x)
+#       self.conv_shapes = self.shared_encoder.conv_shapes
+#       return output
 
 
-def latent_encoder_fn(hiddens, y, n_y, n_z, is_training=True):
-  """The latent encoder function, modelling q(z | x, y).
 
-  Args:
-    hiddens: The shared encoder activations, 2D `Tensor` of size `[B, ...]`.
-    y: Categorical cluster variable, `Tensor` of size `[B, n_y]`.
-    n_y: int, number of dims of y.
-    n_z: int, number of dims of z.
-    is_training: Boolean, whether to build the training graph or an evaluation
-      graph.
+class ClusterEncoder(nn.Module):
+    def __init__(self, input_size, n_y_active, n_y):
+        super(ClusterEncoder, self).__init__()
+        self.mlp_cluster_encoder_final = nn.Linear(input_size, n_y)
+        self.n_y_active = n_y_active
+        self.n_y = n_y
 
-  Returns:
-    The Gaussian distribution `q(z | x, y)`.
-  """
-  del is_training  # unused for now
+    def forward(self, hiddens):
+        logits = self.mlp_cluster_encoder_final(hiddens)
 
-  with tf.control_dependencies([tfc.assert_rank(hiddens, 2)]):
-    # Logits for both mean and variance
-    n_logits = 2 * n_z
+        # Only use the first n_y_active components, and set the remaining to zero.
+        if self.n_y > 1:
+            logits_active = logits[:, :self.n_y_active]
+            probs = F.softmax(logits_active, dim=1)
+            paddings1 = (0, 0)
+            paddings2 = (0, self.n_y - self.n_y_active)
+            probs = F.pad(probs, (paddings1, paddings2), value=0.0) + 1e-12
+        else:
+            probs = torch.ones_like(logits)
 
-    all_logits = []
-    for k in range(n_y):
-      lin = snt.Linear(n_logits, name='mlp_latent_encoder_' + str(k))
-      all_logits.append(lin(hiddens))
+        return torch.distributions.OneHotCategorical(probs=probs)
 
-  # Sum over cluster components.
-  all_logits = tf.stack(all_logits)  # [n_y, B, n_logits]
-  logits = tf.einsum('ij,jik->ik', y, all_logits)
 
-  # Compute distribution from logits.
-  return utils.generate_gaussian(
-      logits=logits, sigma_nonlin='softplus', sigma_param='var')
+# def cluster_encoder_fn(hiddens, n_y_active, n_y, is_training=True):
+#   """The cluster encoder function, modelling q(y | x).
+
+#   Args:
+#     hiddens: The shared encoder activations, 2D `Tensor` of size `[B, ...]`.
+#     n_y_active: Tensor, the number of active components.
+#     n_y: int, number of maximum components allowed (used for tensor size)
+#     is_training: Boolean, whether to build the training graph or an evaluation
+#       graph.
+
+#   Returns:
+#     The distribution `q(y | x)`.
+#   """
+#   del is_training  # unused for now
+#   with tf.control_dependencies([tfc.assert_rank(hiddens, 2)]):
+#     lin = snt.Linear(n_y, name='mlp_cluster_encoder_final')
+#     logits = lin(hiddens)
+
+#   # Only use the first n_y_active components, and set the remaining to zero.
+#   if n_y > 1:
+#     probs = tf.nn.softmax(logits[:, :n_y_active])
+#     logging.info('Cluster softmax active probs shape: %s', str(probs.shape))
+#     paddings1 = tf.stack([tf.constant(0), tf.constant(0)], axis=0)
+#     paddings2 = tf.stack([tf.constant(0), n_y - n_y_active], axis=0)
+#     paddings = tf.stack([paddings1, paddings2], axis=1)
+#     probs = tf.pad(probs, paddings) + 0.0 * logits + 1e-12
+#   else:
+#     probs = tf.ones_like(logits)
+#   logging.info('Cluster softmax probs shape: %s', str(probs.shape))
+
+#   return tfp.distributions.OneHotCategorical(probs=probs)
+
+class LatentEncoder(nn.Module):
+    def __init__(self, input_size, n_y, n_z):
+        super(LatentEncoder, self).__init__()
+        self.n_y = n_y
+        self.n_z = n_z
+        self.mlp_latent_encoder = nn.Linear(input_size, 2 * n_z * n_y)
+
+    def forward(self, hiddens, y):
+        batch_size = hiddens.size(0)
+
+        # Logits for both mean and variance
+        logits = self.mlp_latent_encoder(hiddens)
+        logits = logits.view(self.n_y, batch_size, 2 * self.n_z)  # [n_y, B, 2*n_z]
+
+        # Sum over cluster components.
+        logits = torch.einsum('ij,jik->ik', y, logits)
+
+        # Compute distribution from logits.
+        return utils.generate_gaussian(logits=logits, sigma_nonlin='softplus', sigma_param='var')
+
+
+# def latent_encoder_fn(hiddens, y, n_y, n_z, is_training=True):
+#   """The latent encoder function, modelling q(z | x, y).
+
+#   Args:
+#     hiddens: The shared encoder activations, 2D `Tensor` of size `[B, ...]`.
+#     y: Categorical cluster variable, `Tensor` of size `[B, n_y]`.
+#     n_y: int, number of dims of y.
+#     n_z: int, number of dims of z.
+#     is_training: Boolean, whether to build the training graph or an evaluation
+#       graph.
+
+#   Returns:
+#     The Gaussian distribution `q(z | x, y)`.
+#   """
+#   del is_training  # unused for now
+
+#   with tf.control_dependencies([tfc.assert_rank(hiddens, 2)]):
+#     # Logits for both mean and variance
+#     n_logits = 2 * n_z
+
+#     all_logits = []
+#     for k in range(n_y):
+#       lin = snt.Linear(n_logits, name='mlp_latent_encoder_' + str(k))
+#       all_logits.append(lin(hiddens))
+
+#   # Sum over cluster components.
+#   all_logits = tf.stack(all_logits)  # [n_y, B, n_logits]
+#   logits = tf.einsum('ij,jik->ik', y, all_logits)
+
+#   # Compute distribution from logits.
+#   return utils.generate_gaussian(
+#       logits=logits, sigma_nonlin='softplus', sigma_param='var')
 
 
 def data_decoder_fn(z,
@@ -238,35 +324,53 @@ def data_decoder_fn(z,
 
   return output_dist(logits)
 
+class LatentDecoder(nn.Module):
+    def __init__(self, n_y, n_z):
+        super(LatentDecoder, self).__init__()
+        self.latent_prior_mu = nn.Linear(n_y, n_z)
+        self.latent_prior_sigma = nn.Linear(n_y, n_z)
 
-def latent_decoder_fn(y, n_z, is_training=True):
-  """The latent decoder function, modelling p(z | y).
+    def forward(self, y):
+        if len(y.shape) != 2:
+            raise NotImplementedError('The latent decoder function expects `y` to be '
+                                      '2D, but its shape was {} instead.'.format(str(y.shape)))
 
-  Args:
-    y: Categorical cluster variable, `Tensor` of size `[B, n_y]`.
-    n_z: int, number of dims of z.
-    is_training: Boolean, whether to build the training graph or an evaluation
-      graph.
+        mu = self.latent_prior_mu(y)
+        sigma = self.latent_prior_sigma(y)
 
-  Returns:
-    The Gaussian distribution `p(z | y)`.
-  """
-  del is_training  # Unused for now.
-  if len(y.shape) != 2:
-    raise NotImplementedError('The latent decoder function expects `y` to be '
-                              '2D, but its shape was %s instead.' %
-                              str(y.shape))
+        logits = torch.cat([mu, sigma], dim=1)
 
-  lin_mu = snt.Linear(n_z, name='latent_prior_mu')
-  lin_sigma = snt.Linear(n_z, name='latent_prior_sigma')
+        # Assuming utils.generate_gaussian is a function generating Gaussian distribution
+        return utils.generate_gaussian(logits=logits, sigma_nonlin='softplus', sigma_param='var')
 
-  mu = lin_mu(y)
-  sigma = lin_sigma(y)
+# def latent_decoder_fn(y, n_z, is_training=True):
+#   """The latent decoder function, modelling p(z | y).
 
-  logits = tf.concat([mu, sigma], axis=1)
+#   Args:
+#     y: Categorical cluster variable, `Tensor` of size `[B, n_y]`.
+#     n_z: int, number of dims of z.
+#     is_training: Boolean, whether to build the training graph or an evaluation
+#       graph.
 
-  return utils.generate_gaussian(
-      logits=logits, sigma_nonlin='softplus', sigma_param='var')
+#   Returns:
+#     The Gaussian distribution `p(z | y)`.
+#   """
+#   del is_training  # Unused for now.
+#   if len(y.shape) != 2:
+#     raise NotImplementedError('The latent decoder function expects `y` to be '
+#                               '2D, but its shape was %s instead.' %
+#                               str(y.shape))
+
+#   lin_mu = snt.Linear(n_z, name='latent_prior_mu')
+#   lin_sigma = snt.Linear(n_z, name='latent_prior_sigma')
+
+#   mu = lin_mu(y)
+#   sigma = lin_sigma(y)
+
+#   logits = tf.concat([mu, sigma], axis=1)
+
+#   return utils.generate_gaussian(
+#       logits=logits, sigma_nonlin='softplus', sigma_param='var')
 
 
 class Curl(object):

@@ -20,101 +20,171 @@ import sonnet as snt
 import tensorflow.compat.v1 as tf
 
 tfc = tf.compat.v1
+import torch
+import torch.nn as nn
 
+class ResidualBlock(nn.Module):
+    def __init__(self, num_residual_hiddens, nums_hidden, filter_size=3):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(num_residual_hiddens, num_residual_hiddens, kernel_size=filter_size, stride=1, padding=filter_size//2)
+        self.conv2 = nn.Conv2d(num_residual_hiddens, nums_hidden, kernel_size=1, stride=1, padding=0)
+        self.activation = nn.ReLU()
 
-class ResidualStack(snt.AbstractModule):
-  """A stack of ResNet V2 blocks."""
+    def forward(self, x):
+        h_i = self.activation(x)
+        h_i = self.conv1(h_i)
+        h_i = self.activation(h_i)
+        h_i = self.conv2(h_i)
+        return x + h_i
 
-  def __init__(self,
-               num_hiddens,
-               num_residual_layers,
-               num_residual_hiddens,
-               filter_size=3,
-               initializers=None,
-               data_format='NHWC',
-               activation=tf.nn.relu,
-               name='residual_stack'):
-    """Instantiate a ResidualStack."""
-    super(ResidualStack, self).__init__(name=name)
-    self._num_hiddens = num_hiddens
-    self._num_residual_layers = num_residual_layers
-    self._num_residual_hiddens = num_residual_hiddens
-    self._filter_size = filter_size
-    self._initializers = initializers
-    self._data_format = data_format
-    self._activation = activation
+class ResidualStack(nn.Module):
+    def __init__(self, num_hiddens, num_residual_layers, num_residual_hiddens, filter_size=3, activation=nn.ReLU()):
+        super(ResidualStack, self).__init__()
+        self.num_hiddens = num_hiddens
+        self.num_residual_layers = num_residual_layers
+        self.num_residual_hiddens = num_residual_hiddens
+        self.filter_size = filter_size
+        self.activation = activation
 
-  def _build(self, h):
-    for i in range(self._num_residual_layers):
-      h_i = self._activation(h)
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(num_residual_hiddens, num_hiddens,  filter_size) for _ in range(num_residual_layers)
+        ])
 
-      h_i = snt.Conv2D(
-          output_channels=self._num_residual_hiddens,
-          kernel_shape=(self._filter_size, self._filter_size),
-          stride=(1, 1),
-          initializers=self._initializers,
-          data_format=self._data_format,
-          name='res_nxn_%d' % i)(
-              h_i)
-      h_i = self._activation(h_i)
+    def forward(self, x):
+        for block in self.residual_blocks:
+            x = block(x)
+        return self.activation(x)
 
-      h_i = snt.Conv2D(
-          output_channels=self._num_hiddens,
-          kernel_shape=(1, 1),
-          stride=(1, 1),
-          initializers=self._initializers,
-          data_format=self._data_format,
-          name='res_1x1_%d' % i)(
-              h_i)
-      h += h_i
-    return self._activation(h)
+# class ResidualStack(snt.AbstractModule):
+#   """A stack of ResNet V2 blocks."""
 
+#   def __init__(self,
+#                num_hiddens,
+#                num_residual_layers,
+#                num_residual_hiddens,
+#                filter_size=3,
+#                initializers=None,
+#                data_format='NHWC',
+#                activation=tf.nn.relu,
+#                name='residual_stack'):
+#     """Instantiate a ResidualStack."""
+#     super(ResidualStack, self).__init__(name=name)
+#     self._num_hiddens = num_hiddens
+#     self._num_residual_layers = num_residual_layers
+#     self._num_residual_hiddens = num_residual_hiddens
+#     self._filter_size = filter_size
+#     self._initializers = initializers
+#     self._data_format = data_format
+#     self._activation = activation
 
-class SharedConvModule(snt.AbstractModule):
-  """Convolutional decoder."""
+#   def _build(self, h):
+#     for i in range(self._num_residual_layers):
+#       h_i = self._activation(h)
 
-  def __init__(self,
-               filters,
-               kernel_size,
-               activation,
-               strides,
-               name='shared_conv_encoder'):
-    super(SharedConvModule, self).__init__(name=name)
+#       h_i = snt.Conv2D(
+#           output_channels=self._num_residual_hiddens,
+#           kernel_shape=(self._filter_size, self._filter_size),
+#           stride=(1, 1),
+#           initializers=self._initializers,
+#           data_format=self._data_format,
+#           name='res_nxn_%d' % i)(
+#               h_i)
+#       h_i = self._activation(h_i)
 
-    self._filters = filters
-    self._kernel_size = kernel_size
-    self._activation = activation
-    self.strides = strides
-    assert len(strides) == len(filters) - 1
-    self.conv_shapes = None
+#       h_i = snt.Conv2D(
+#           output_channels=self._num_hiddens,
+#           kernel_shape=(1, 1),
+#           stride=(1, 1),
+#           initializers=self._initializers,
+#           data_format=self._data_format,
+#           name='res_1x1_%d' % i)(
+#               h_i)
+#       h += h_i
+#     return self._activation(h)
 
-  def _build(self, x, is_training=True):
-    with tf.control_dependencies([tfc.assert_rank(x, 4)]):
+class SharedConvModule(nn.Module):
+    def __init__(self, filters, kernel_size, activation, strides):
+        super(SharedConvModule, self).__init__()
 
-      self.conv_shapes = [x.shape.as_list()]  # Needed by deconv module
-      conv = x
-    for i, (filter_i,
-            stride_i) in enumerate(zip(self._filters, self.strides), 1):
-      conv = tf.layers.Conv2D(
-          filters=filter_i,
-          kernel_size=self._kernel_size,
-          padding='same',
-          activation=self._activation,
-          strides=stride_i,
-          name='enc_conv_%d' % i)(
-              conv)
-      self.conv_shapes.append(conv.shape.as_list())
-    conv_flat = snt.BatchFlatten()(conv)
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.activation = activation
+        self.strides = strides
+        assert len(strides) == len(filters) - 1
+        self.conv_shapes = None
 
-    enc_mlp = snt.nets.MLP(
-        name='enc_mlp',
-        output_sizes=[self._filters[-1]],
-        activation=self._activation,
-        activate_final=True)
-    h = enc_mlp(conv_flat)
+        self.conv_layers = nn.ModuleList([
+            nn.Conv2d(filters[i - 1], filters[i], kernel_size=kernel_size, padding='same', stride=strides[i - 1])
+            for i in range(1, len(filters))
+        ])
 
-    logging.info('Shared conv module layer shapes:')
-    logging.info('\n'.join([str(el) for el in self.conv_shapes]))
-    logging.info(h.shape.as_list())
+        self.conv_shapes = []
 
-    return h
+    def forward(self, x):
+        for i, conv_layer in enumerate(self.conv_layers, 1):
+            x = conv_layer(x)
+            self.conv_shapes.append(x.shape)
+            # x = self.activation(x)
+
+        x = x.view(x.size(0), -1)
+
+        enc_mlp = nn.Sequential(
+            nn.Linear(len(x), self.filters[-1]),
+            self.activation
+        )
+        h = enc_mlp(x)
+
+        print('Shared conv module layer shapes:')
+        print('\n'.join([str(el) for el in self.conv_shapes]))
+        print(h.shape)
+
+        return h
+
+# class SharedConvModule(snt.AbstractModule):
+#   """Convolutional decoder."""
+
+#   def __init__(self,
+#                filters,
+#                kernel_size,
+#                activation,
+#                strides,
+#                name='shared_conv_encoder'):
+#     super(SharedConvModule, self).__init__(name=name)
+
+#     self._filters = filters
+#     self._kernel_size = kernel_size
+#     self._activation = activation
+#     self.strides = strides
+#     assert len(strides) == len(filters) - 1
+#     self.conv_shapes = None
+
+#   def _build(self, x, is_training=True):
+#     with tf.control_dependencies([tfc.assert_rank(x, 4)]):
+
+#       self.conv_shapes = [x.shape.as_list()]  # Needed by deconv module
+#       conv = x
+#     for i, (filter_i,
+#             stride_i) in enumerate(zip(self._filters, self.strides), 1):
+#       conv = tf.layers.Conv2D(
+#           filters=filter_i,
+#           kernel_size=self._kernel_size,
+#           padding='same',
+#           activation=self._activation,
+#           strides=stride_i,
+#           name='enc_conv_%d' % i)(
+#               conv)
+#       self.conv_shapes.append(conv.shape.as_list())
+#     conv_flat = snt.BatchFlatten()(conv)
+
+#     enc_mlp = snt.nets.MLP(
+#         name='enc_mlp',
+#         output_sizes=[self._filters[-1]],
+#         activation=self._activation,
+#         activate_final=True)
+#     h = enc_mlp(conv_flat)
+
+#     logging.info('Shared conv module layer shapes:')
+#     logging.info('\n'.join([str(el) for el in self.conv_shapes]))
+#     logging.info(h.shape.as_list())
+
+#     return h

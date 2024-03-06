@@ -21,13 +21,18 @@ from absl import logging
 
 import numpy as np
 from sklearn import neighbors
-import sonnet as snt
+# import sonnet as snt
 import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 import tensorflow_probability as tfp
+import torch
+from torcheval.metrics.functional import multiclass_confusion_matrix
+import torch.distributions as distributions
+import torch.optim as optim
 
 from curl import model
 from curl import utils
+from CURL.curl.data_loader import load_data
 
 tfc = tf.compat.v1
 
@@ -47,6 +52,19 @@ DatasetTuple = collections.namedtuple('DatasetTuple', [
 
 def compute_purity(confusion):
   return np.sum(np.max(confusion, axis=0)).astype(float) / np.sum(confusion)
+
+
+def binarize_fn(x):
+    """Binarize a Bernoulli by rounding the probabilities.
+
+    Args:
+      x: torch tensor, input image.
+
+    Returns:
+      A torch tensor with the binarized image
+    """
+    return torch.gt(x, 0.5 * torch.ones_like(x)).float()
+
 
 
 def process_dataset(iterator,
@@ -128,7 +146,7 @@ def get_data_sources(dataset, dataset_kwargs, batch_size, test_batch_size,
       **dataset_kwargs)
 
   # Validate assumption that data is in [0, 255]
-  assert ds_info.features[image_key].dtype == tf.uint8
+  assert ds_info.features[image_key].dtype == torch.uint8
 
   n_classes = ds_info.features[label_key].num_classes
   num_train_examples = ds_info.splits['train'].num_examples
@@ -247,35 +265,35 @@ def setup_training_and_eval_graphs(x, label, y, n_y, curl_model,
    kl_z_supervised) = curl_model.log_prob_elbo_components(x, y)
 
   ll = log_p_x - kl_y - kl_z
-  elbo = -tf.reduce_mean(ll)
+  elbo = -torch.mean(ll)
 
   # Supervised loss, either for SMGR, or adaptation to supervised benchmark.
   ll_supervised = log_p_x_supervised - kl_y_supervised - kl_z_supervised
-  elbo_supervised = -tf.reduce_mean(ll_supervised)
+  elbo_supervised = -torch.mean(ll_supervised)
 
   # Summaries
-  kl_y = tf.reduce_mean(kl_y)
-  kl_z = tf.reduce_mean(kl_z)
-  log_p_x_supervised = tf.reduce_mean(log_p_x_supervised)
-  kl_y_supervised = tf.reduce_mean(kl_y_supervised)
-  kl_z_supervised = tf.reduce_mean(kl_z_supervised)
+  kl_y = torch.mean(kl_y)
+  kl_z = torch.mean(kl_z)
+  log_p_x_supervised = torch.mean(log_p_x_supervised)
+  kl_y_supervised = torch.mean(kl_y_supervised)
+  kl_z_supervised = torch.mean(kl_z_supervised)
 
   # Evaluation.
   hiddens = curl_model.get_shared_rep(x, is_training=is_training)
   cat = curl_model.infer_cluster(hiddens)
   cat_probs = cat.probs
 
-  confusion = tf.confusion_matrix(label, tf.argmax(cat_probs, axis=1),
-                                  num_classes=n_y, name=name + '_confusion')
-  purity = (tf.reduce_sum(tf.reduce_max(confusion, axis=0))
-            / tf.reduce_sum(confusion))
+  confusion = multiclass_confusion_matrix(label, torch.argmax(cat_probs, axis=1),
+                                  num_classes=n_y)
+  purity = (torch.sum(torch.max(confusion, axis=0))
+            / torch.sum(confusion))
 
   if classify_with_samples:
     latents = curl_model.infer_latent(
-        hiddens=hiddens, y=tf.to_float(cat.sample())).sample()
+        hiddens=hiddens, y= cat.sample().float()).sample()
   else:
     latents = curl_model.infer_latent(
-        hiddens=hiddens, y=tf.to_float(cat.mode())).mean()
+        hiddens=hiddens, y= cat.mode().float()).mean()
 
   return MainOps(elbo, ll, log_p_x, kl_y, kl_z, elbo_supervised, ll_supervised,
                  log_p_x_supervised, kl_y_supervised, kl_z_supervised,
@@ -299,7 +317,7 @@ def get_generated_data(sess, gen_op, y_input, gen_buffer_size,
       The corresponding labels
   """
 
-  batch_size, n_y = y_input.shape.as_list()
+  batch_size, n_y = y_input.shape.tolist()
 
   # Sample based on the history of all components used.
   cluster_sample_probs = component_counts.astype(float)
@@ -317,7 +335,7 @@ def get_generated_data(sess, gen_op, y_input, gen_buffer_size,
         p=cluster_sample_probs)
     y_gen_posterior_vals = np.zeros((batch_size, n_y))
     y_gen_posterior_vals[np.arange(batch_size), gen_label] = 1
-    gen_image = sess.run(gen_op, feed_dict={y_input: y_gen_posterior_vals})
+    gen_image = sess.run(gen_op, feed_dict={y_input: y_gen_posterior_vals})   # figure out what exactly gen op is 
     gen_buffer_images.append(gen_image)
     gen_buffer_labels.append(gen_label)
 
@@ -327,7 +345,7 @@ def get_generated_data(sess, gen_op, y_input, gen_buffer_size,
   return gen_buffer_images, gen_buffer_labels
 
 
-def setup_dynamic_ops(n_y):
+def get_encoder_params(n_y):
   """Set up ops to move / copy mixture component weights for dynamic expansion.
 
   Args:
@@ -338,101 +356,43 @@ def setup_dynamic_ops(n_y):
 
   """
   # Set up graph ops to dynamically modify component params.
-  graph = tf.get_default_graph()
+  # graph = tf.get_default_graph()
 
   # 1) Ops to get and set latent encoder params (entire tensors)
   latent_enc_tensors = {}
+  named_parameters = model.named_parameters()
+  named_parameters = dict(named_parameters)
   for k in range(n_y):
-    latent_enc_tensors['latent_w_' + str(k)] = graph.get_tensor_by_name(
-        'latent_encoder/mlp_latent_encoder_{}/w:0'.format(k))
-    latent_enc_tensors['latent_b_' + str(k)] = graph.get_tensor_by_name(
-        'latent_encoder/mlp_latent_encoder_{}/b:0'.format(k))
+    latent_enc_tensors['latent_w_' + str(k)] = named_parameters[
+        'latent_encoder/mlp_latent_encoder_{}/w:0'.format(k)]
+    latent_enc_tensors['latent_b_' + str(k)] = named_parameters[
+        'latent_encoder/mlp_latent_encoder_{}/b:0'.format(k)]
 
-  latent_enc_assign_ops = {}
-  latent_enc_phs = {}
-  for key, tensor in latent_enc_tensors.items():
-    latent_enc_phs[key] = tfc.placeholder(tensor.dtype, tensor.shape)
-    latent_enc_assign_ops[key] = tf.assign(tensor, latent_enc_phs[key])
+  cluster_w = named_parameters[
+      'cluster_encoder/mlp_cluster_encoder_final/w:0']
+  cluster_b = named_parameters[
+      'cluster_encoder/mlp_cluster_encoder_final/b:0']
 
-  # 2) Ops to get and set cluster encoder params (columns of a tensor)
-  # We will be copying column ind_from to column ind_to.
-  cluster_w = graph.get_tensor_by_name(
-      'cluster_encoder/mlp_cluster_encoder_final/w:0')
-  cluster_b = graph.get_tensor_by_name(
-      'cluster_encoder/mlp_cluster_encoder_final/b:0')
 
-  ind_from = tfc.placeholder(dtype=tf.int32)
-  ind_to = tfc.placeholder(dtype=tf.int32)
+  latent_prior_mu_w = named_parameters[
+      'latent_decoder/latent_prior_mu/w:0']
+  latent_prior_sigma_w = named_parameters[
+      'latent_decoder/latent_prior_sigma/w:0']
 
-  # Determine indices of cluster encoder weights and biases to be updated
-  w_indices = tf.transpose(
-      tf.stack([
-          tf.range(cluster_w.shape[0], dtype=tf.int32),
-          ind_to * tf.ones(shape=(cluster_w.shape[0],), dtype=tf.int32)
-      ]))
-  b_indices = ind_to
-  # Determine updates themselves
-  cluster_w_updates = tf.squeeze(
-      tf.slice(cluster_w, begin=(0, ind_from), size=(cluster_w.shape[0], 1)))
-  cluster_b_updates = cluster_b[ind_from]
-  # Create update ops
-  cluster_w_update_op = tf.scatter_nd_update(cluster_w, w_indices,
-                                             cluster_w_updates)
-  cluster_b_update_op = tf.scatter_update(cluster_b, b_indices,
-                                          cluster_b_updates)
-
-  # 3) Ops to get and set latent prior params (columns of a tensor)
-  # We will be copying column ind_from to column ind_to.
-  latent_prior_mu_w = graph.get_tensor_by_name(
-      'latent_decoder/latent_prior_mu/w:0')
-  latent_prior_sigma_w = graph.get_tensor_by_name(
-      'latent_decoder/latent_prior_sigma/w:0')
-
-  mu_indices = tf.transpose(
-      tf.stack([
-          ind_to * tf.ones(shape=(latent_prior_mu_w.shape[1],), dtype=tf.int32),
-          tf.range(latent_prior_mu_w.shape[1], dtype=tf.int32)
-      ]))
-  mu_updates = tf.squeeze(
-      tf.slice(
-          latent_prior_mu_w,
-          begin=(ind_from, 0),
-          size=(1, latent_prior_mu_w.shape[1])))
-  mu_update_op = tf.scatter_nd_update(latent_prior_mu_w, mu_indices, mu_updates)
-  sigma_indices = tf.transpose(
-      tf.stack([
-          ind_to *
-          tf.ones(shape=(latent_prior_sigma_w.shape[1],), dtype=tf.int32),
-          tf.range(latent_prior_sigma_w.shape[1], dtype=tf.int32)
-      ]))
-  sigma_updates = tf.squeeze(
-      tf.slice(
-          latent_prior_sigma_w,
-          begin=(ind_from, 0),
-          size=(1, latent_prior_sigma_w.shape[1])))
-  sigma_update_op = tf.scatter_nd_update(latent_prior_sigma_w, sigma_indices,
-                                         sigma_updates)
-
-  dynamic_ops = {
-      'ind_from_ph': ind_from,
-      'ind_to_ph': ind_to,
+  encoder_params = {
       'latent_enc_tensors': latent_enc_tensors,
-      'latent_enc_assign_ops': latent_enc_assign_ops,
-      'latent_enc_phs': latent_enc_phs,
-      'cluster_w_update_op': cluster_w_update_op,
-      'cluster_b_update_op': cluster_b_update_op,
-      'mu_update_op': mu_update_op,
-      'sigma_update_op': sigma_update_op
+      'cluster_w': cluster_w,
+      'cluster_b': cluster_b,
+      'latent_prior_mu_w': latent_prior_mu_w,
+      'latent_prior_sigma_w': latent_prior_sigma_w
   }
 
-  return dynamic_ops
+  return encoder_params
 
 
-def copy_component_params(ind_from, ind_to, sess, ind_from_ph, ind_to_ph,
-                          latent_enc_tensors, latent_enc_assign_ops,
-                          latent_enc_phs,
-                          cluster_w_update_op, cluster_b_update_op,
-                          mu_update_op, sigma_update_op):
+def copy_component_params(ind_from, ind_to, cluster_w, cluster_b, 
+                          latent_enc_tensors, latent_prior_sigma_w, 
+                          latent_prior_mu_w):
   """Copy parameters from component i to component j.
 
   Args:
@@ -450,30 +410,48 @@ def copy_component_params(ind_from, ind_to, sess, ind_from_ph, ind_to_ph,
     sigma_update_op: op for updating sigma weights of latent prior.
 
   """
-  update_ops = []
-  feed_dict = {}
+
   # Copy for latent encoder.
-  new_w_val, new_b_val = sess.run([
-      latent_enc_tensors['latent_w_' + str(ind_from)],
-      latent_enc_tensors['latent_b_' + str(ind_from)]
-  ])
-  update_ops.extend([
-      latent_enc_assign_ops['latent_w_' + str(ind_to)],
-      latent_enc_assign_ops['latent_b_' + str(ind_to)]
-  ])
-  feed_dict.update({
-      latent_enc_phs['latent_w_' + str(ind_to)]: new_w_val,
-      latent_enc_phs['latent_b_' + str(ind_to)]: new_b_val
-  })
+  new_w_val, new_b_val = [latent_enc_tensors['latent_w_' + str(ind_from)],latent_enc_tensors['latent_b_' + str(ind_from)]]
+  with torch.no_grad(): 
+    latent_enc_tensors['latent_w_' + str(ind_to)] = latent_enc_tensors['latent_w_' + str(ind_to)].copy_(new_w_val)
+    latent_enc_tensors['latent_b_' + str(ind_to)] = latent_enc_tensors['latent_w_' + str(ind_to)].copy_(new_b_val)
+
 
   # Copy for cluster encoder softmax.
-  update_ops.extend([cluster_w_update_op, cluster_b_update_op])
-  feed_dict.update({ind_from_ph: ind_from, ind_to_ph: ind_to})
+  w_indices = torch.stack([
+          torch.range(cluster_w.shape[0], dtype=torch.int32),
+          ind_to * torch.ones(shape=(cluster_w.shape[0],), dtype=torch.int32)
+      ])   # shape cluster_w.shape[0], 2
+  b_indices = ind_to
 
-  # Copy for latent prior.
-  update_ops.extend([mu_update_op, sigma_update_op])
-  feed_dict.update({ind_from_ph: ind_from, ind_to_ph: ind_to})
-  sess.run(update_ops, feed_dict)
+  cluster_w_updates = torch.squeeze(cluster_w[:, ind_from].unsqueeze(1)) # shape cluster_w.shape[0], 1
+  cluster_b_updates = cluster_b[ind_from]
+  with torch.no_grad():  # Disable gradient tracking for inplace operations
+    # For updating cluster_w
+    cluster_w[w_indices[0], w_indices[1]] = cluster_w_updates
+
+    # For updating cluster_b
+    cluster_b[b_indices] = cluster_b_updates
+
+  mu_indices = torch.stack([
+          ind_to * torch.ones(shape=(latent_prior_mu_w.shape[1],), dtype=torch.int32),
+          torch.arange(latent_prior_mu_w.shape[1], dtype=torch.int32)
+      ])
+  mu_updates = latent_prior_mu_w[ind_from, :]
+
+  with torch.no_grad():  # Disable gradient tracking for inplace operations
+    latent_prior_mu_w[mu_indices[0], mu_indices[1]] = mu_updates
+
+  sigma_indices = torch.stack([
+          ind_to *
+          torch.ones(shape=(latent_prior_sigma_w.shape[1],), dtype=torch.int32),
+          torch.arange(latent_prior_sigma_w.shape[1], dtype=torch.int32)
+      ])
+  sigma_updates = latent_prior_sigma_w[ind_from, :]
+  with torch.no_grad():  # Disable gradient tracking for inplace operations
+    latent_prior_sigma_w[sigma_indices[0], sigma_indices[1]] = sigma_updates
+
 
 
 def run_training(
@@ -482,7 +460,7 @@ def run_training(
     n_concurrent_classes,
     blend_classes,
     train_supervised,
-    n_steps,
+    n_epochs,
     random_seed,
     lr_init,
     lr_factor,
@@ -508,7 +486,7 @@ def run_training(
     n_concurrent_classes: int, # of classes seen at a time (ignored for 'iid').
     blend_classes: bool, whether to blend in samples from the next class.
     train_supervised: bool, whether to use supervision during training.
-    n_steps: int, number of total training steps.
+    n_epochs: int, number of total training steps.
     random_seed: int, seed for tf and numpy RNG.
     lr_init: float, initial learning rate.
     lr_factor: float, learning rate decay factor.
@@ -530,45 +508,47 @@ def run_training(
   """
 
   # Set tf random seed.
-  tfc.set_random_seed(random_seed)
+  torch.manual_seed(random_seed)
   np.set_printoptions(precision=2, suppress=True)
 
   # First set up the data source(s) and get dataset info.
   if dataset == 'mnist':
     batch_size = 100
     test_batch_size = 1000
-    dataset_kwargs = {}
-    image_key = 'image'
-    label_key = 'label'
+    # dataset_kwargs = {}
+    # image_key = 'image'
+    # label_key = 'label'
   elif dataset == 'omniglot':
     batch_size = 15
     test_batch_size = 1318
-    dataset_kwargs = {}
-    image_key = 'image'
-    label_key = 'alphabet'
+    # dataset_kwargs = {}
+    # image_key = 'image'
+    # label_key = 'alphabet'
   else:
     raise NotImplementedError
 
-  dataset_ops = get_data_sources(dataset, dataset_kwargs, batch_size,
-                                 test_batch_size, training_data_type,
-                                 n_concurrent_classes, image_key, label_key)
-  train_data = dataset_ops.train_data
-  train_data_for_clf = dataset_ops.train_data_for_clf
-  valid_data = dataset_ops.valid_data
-  test_data = dataset_ops.test_data
+  # dataset_ops = get_data_sources(dataset, dataset_kwargs, batch_size,
+  #                                test_batch_size, training_data_type,
+  #                                n_concurrent_classes, image_key, label_key)
+  dataset_tuple = load_data(dataset, training_data_type, n_concurrent_classes, batch_size, test_batch_size )
 
-  output_shape = dataset_ops.ds_info.features[image_key].shape
+  train_dataloader = dataset_tuple.train_dataloader
+  train_dataloader_for_clf = dataset_tuple.train_dataloader_for_clf
+  valid_dataloader = dataset_tuple.valid_dataloader
+  test_dataloader = dataset_tuple.test_dataloader
+
+  output_shape = dataset_tuple.output_shape
   n_x = np.prod(output_shape)
-  n_classes = dataset_ops.ds_info.features[label_key].num_classes
-  num_train_examples = dataset_ops.ds_info.splits['train'].num_examples
+  n_classes = dataset_tuple.n_classes
+  num_train_examples = dataset_tuple.num_train_examples
 
   # Check that the number of classes is compatible with the training scenario
   assert n_classes % n_concurrent_classes == 0
-  assert n_steps % (n_classes / n_concurrent_classes) == 0
+  assert n_epochs % (n_classes / n_concurrent_classes) == 0
 
   # Set specific params depending on the type of gen replay
   if gen_replay_type == 'fixed':
-    data_period = data_period = int(n_steps /
+    data_period = data_period = int(n_epochs /
                                     (n_classes / n_concurrent_classes))
     gen_every_n = 2  # Blend in a gen replay batch every 2 steps
     gen_refresh_period = data_period  # How often to refresh the batches of
@@ -595,56 +575,49 @@ def run_training(
 
   # Define a global tf variable for the number of active components.
   n_y_active_np = n_y_active
-  n_y_active = tfc.get_variable(
-      initializer=tf.constant(n_y_active_np, dtype=tf.int32),
-      trainable=False,
-      name='n_y_active',
-      dtype=tf.int32)
+  n_y_active = torch.tensor(n_y_active_np, dtype=torch.int32, requires_grad=False)
 
   logging.info('Starting CURL script on %s data.', dataset)
 
   # Set up placeholders for training.
 
-  x_train_raw = tfc.placeholder(
-      dtype=tf.float32, shape=(batch_size,) + output_shape)
-  label_train = tfc.placeholder(dtype=tf.int32, shape=(batch_size,))
+  # x_train_raw = tfc.placeholder(
+  #     dtype=tf.float32, shape=(batch_size,) + output_shape)
+  # label_train = tfc.placeholder(dtype=tf.int32, shape=(batch_size,))
 
-  def binarize_fn(x):
-    """Binarize a Bernoulli by rounding the probabilities.
 
-    Args:
-      x: tf tensor, input image.
 
-    Returns:
-      A tf tensor with the binarized image
-    """
-    return tf.cast(tf.greater(x, 0.5 * tf.ones_like(x)), tf.float32)
+  # if dataset == 'mnist':
+  #   x_train = binarize_fn(x_train_raw)
+  #   x_valid = binarize_fn(valid_data[image_key]) if valid_data else None
+  #   x_test = binarize_fn(test_data[image_key])
+  #   x_train_for_clf = binarize_fn(train_data_for_clf[image_key])
+  # elif 'cifar' in dataset or dataset == 'omniglot':
+  #   x_train = x_train_raw
+  #   x_valid = valid_data[image_key] if valid_data else None
+  #   x_test = test_data[image_key]
+  #   x_train_for_clf = train_data_for_clf[image_key]
+  # else:
+  #   raise ValueError('Unknown dataset {}'.format(dataset))
 
-  if dataset == 'mnist':
-    x_train = binarize_fn(x_train_raw)
-    x_valid = binarize_fn(valid_data[image_key]) if valid_data else None
-    x_test = binarize_fn(test_data[image_key])
-    x_train_for_clf = binarize_fn(train_data_for_clf[image_key])
-  elif 'cifar' in dataset or dataset == 'omniglot':
-    x_train = x_train_raw
-    x_valid = valid_data[image_key] if valid_data else None
-    x_test = test_data[image_key]
-    x_train_for_clf = train_data_for_clf[image_key]
-  else:
-    raise ValueError('Unknown dataset {}'.format(dataset))
+  x_train, _ = train_dataloader.next()
+  x_valid, label_valid = valid_dataloader.next()
+  x_test, label_test = test_dataloader.next()
+  x_train_for_clf, _ = train_dataloader_for_clf.next()
 
-  label_valid = valid_data[label_key] if valid_data else None
-  label_test = test_data[label_key]
+
+  # label_valid = valid_data[label_key] if valid_data else None
+  # label_test = test_data[label_key]
 
   # Set up CURL modules.
   shared_encoder = model.SharedEncoder(name='shared_encoder', **encoder_kwargs)
   latent_encoder = functools.partial(model.latent_encoder_fn, n_y=n_y, n_z=n_z)
-  latent_encoder = snt.Module(latent_encoder, name='latent_encoder')
+  # latent_encoder = snt.Module(latent_encoder, name='latent_encoder')
   latent_decoder = functools.partial(model.latent_decoder_fn, n_z=n_z)
-  latent_decoder = snt.Module(latent_decoder, name='latent_decoder')
+  # latent_decoder = snt.Module(latent_decoder, name='latent_decoder')
   cluster_encoder = functools.partial(
       model.cluster_encoder_fn, n_y_active=n_y_active, n_y=n_y)
-  cluster_encoder = snt.Module(cluster_encoder, name='cluster_encoder')
+  # cluster_encoder = snt.Module(cluster_encoder, name='cluster_encoder')
   data_decoder = functools.partial(
       model.data_decoder_fn,
       output_type=output_type,
@@ -652,18 +625,26 @@ def run_training(
       n_x=n_x,
       n_y=n_y,
       **decoder_kwargs)
-  data_decoder = snt.Module(data_decoder, name='data_decoder')
+  # data_decoder = snt.Module(data_decoder, name='data_decoder')
 
   # Uniform prior over y.
   prior_train_probs = utils.construct_prior_probs(batch_size, n_y, n_y_active)
-  prior_train = snt.Module(
-      lambda: tfp.distributions.OneHotCategorical(probs=prior_train_probs),
-      name='prior_unconditional_train')
+  # prior_train = snt.Module(
+  #     lambda: tfp.distributions.OneHotCategorical(probs=prior_train_probs),
+  #     name='prior_unconditional_train')
+  class PriorDist(torch.nn.Module):
+    def __init__(self, prior_train_probs, name='prior_unconditional_train'):
+        super(PriorDist, self).__init__()
+        self.one_hot_categorical = distributions.OneHotCategorical(probs=prior_train_probs)
+
+    def forward(self):
+        # Sample from the distribution
+        return self.one_hot_categorical.sample()
+    
+  prior_train = PriorDist(prior_train_probs)
   prior_test_probs = utils.construct_prior_probs(test_batch_size, n_y,
                                                  n_y_active)
-  prior_test = snt.Module(
-      lambda: tfp.distributions.OneHotCategorical(probs=prior_test_probs),
-      name='prior_unconditional_test')
+  prior_test = PriorDist(prior_test_probs, "prior_unconditional_test")
 
   model_train = model.Curl(
       prior_train,
@@ -675,6 +656,7 @@ def run_training(
       n_y_active,
       is_training=True,
       name='curl_train')
+  
   model_eval = model.Curl(
       prior_test,
       latent_decoder,
@@ -687,7 +669,7 @@ def run_training(
       name='curl_test')
 
   # Set up training graph
-  y_train = label_train if train_supervised else None
+  # y_train = label_train if train_supervised else None
   y_valid = label_valid if train_supervised else None
   y_test = label_test if train_supervised else None
 
@@ -707,13 +689,13 @@ def run_training(
 
   if classify_with_samples:
     latents_for_clf = model_eval.infer_latent(
-        hiddens=hiddens_for_clf, y=tf.to_float(cat_for_clf.sample())).sample()
+        hiddens=hiddens_for_clf, y=cat_for_clf.sample().float()).sample()
   else:
     latents_for_clf = model_eval.infer_latent(
-        hiddens=hiddens_for_clf, y=tf.to_float(cat_for_clf.mode())).mean()
+        hiddens=hiddens_for_clf, y=cat_for_clf.mode().float()).mean()
 
   # Set up validation graph
-  if valid_data is not None:
+  if valid_dataloader is not None:
     valid_ops = setup_training_and_eval_graphs(
         x_valid,
         label_valid,
@@ -736,15 +718,17 @@ def run_training(
       name='test')
 
   # Set up optimizer (with scheduler).
-  global_step = tf.train.get_or_create_global_step()
-  lr_schedule = [
-      tf.cast(el * num_train_examples / batch_size, tf.int64)
-      for el in lr_schedule
-  ]
-  num_schedule_steps = tf.reduce_sum(
-      tf.cast(global_step >= lr_schedule, tf.float32))
-  lr = float(lr_init) * float(lr_factor)**num_schedule_steps
-  optimizer = tf.train.AdamOptimizer(learning_rate=lr)
+  # global_step = tf.train.get_or_create_global_step()
+  # lr_schedule = [
+  #     tf.cast(el * num_train_examples / batch_size, tf.int64)
+  #     for el in lr_schedule
+  # ]
+  # num_schedule_steps = tf.reduce_sum(
+  #     tf.cast(global_step >= lr_schedule, tf.float32))
+  lr = float(lr_init) * float(lr_factor)**len(lr_schedule)
+  optimizer = optim.Adam(lr=lr)
+
+
   with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
     train_step = optimizer.minimize(train_ops.elbo)
     train_step_supervised = optimizer.minimize(train_ops.elbo_supervised)
@@ -771,9 +755,9 @@ def run_training(
         int(gen_refresh_period / gen_every_n), max_gen_batches)
 
     # Class each sample should be drawn from (default to uniform prior)
-    y_gen = tfp.distributions.OneHotCategorical(
+    y_gen = distributions.OneHotCategorical(
         probs=np.ones((batch_size, n_y)) / n_y,
-        dtype=tf.float32,
+        dtype=torch.float32,
         name='extra_train_classes').sample()
 
     gen_samples = model_train.sample(y=y_gen, mean=True)
@@ -781,11 +765,11 @@ def run_training(
       gen_samples = binarize_fn(gen_samples)
 
   # Set up ops to dynamically modify parameters (for dynamic expansion)
-  dynamic_ops = setup_dynamic_ops(n_y)
+  encoder_params = get_encoder_params(n_y)
 
   logging.info('Created computation graph.')
 
-  n_steps_per_class = n_steps / n_classes  # pylint: disable=invalid-name
+  n_epochs_per_class = n_epochs / n_classes  # pylint: disable=invalid-name
 
   cumulative_component_counts = np.array([0] * n_y).astype(float)
   recent_component_counts = np.array([0] * n_y).astype(float)
@@ -802,7 +786,7 @@ def run_training(
   gen_buffer_ind = 0
   eligible_for_expansion = False  # Flag to ensure we wait a bit after expansion
 
-  # Set up basic ops to run and quantities to log.
+  # Set up basic ops to run and quantities to log. These are no longer ops but the actual values
   ops_to_run = {
       'train_ELBO': train_ops.elbo,
       'train_log_p_x': train_ops.log_p_x,
@@ -813,7 +797,7 @@ def run_training(
       'train_probs': train_ops.cat_probs,
       'n_y_active': n_y_active
   }
-  if valid_data is not None:
+  if valid_dataloader is not None:
     valid_ops_to_run = {
         'valid_ELBO': valid_ops.elbo,
         'valid_kl_y': valid_ops.kl_y,
@@ -830,7 +814,7 @@ def run_training(
   }
   to_log = ['train_batch_purity']
   to_log_eval = ['test_purity', 'test_ELBO', 'test_kl_y', 'test_kl_z']
-  if valid_data is not None:
+  if valid_dataloader is not None:
     to_log_eval += ['valid_ELBO', 'valid_purity']
 
   if train_supervised:
@@ -858,326 +842,326 @@ def run_training(
     default_train_step = train_step
     to_log += ['train_ELBO', 'train_kl_y', 'train_kl_z']
 
-  with tf.train.SingularMonitoredSession() as sess:
+  # with tf.train.SingularMonitoredSession() as sess:
 
-    for step in range(n_steps):
-      feed_dict = {}
+  for step in range(n_epochs):
+    feed_dict = {}
 
-      # Use the default training loss, but vary it each step depending on the
-      # training scenario (eg. for supervised gen replay, we alternate losses)
-      ops_to_run['train_step'] = default_train_step
+    # Use the default training loss, but vary it each step depending on the
+    # training scenario (eg. for supervised gen replay, we alternate losses)
+    ops_to_run['train_step'] = default_train_step
 
-      ### 1) PERIODICALLY TAKE SNAPSHOTS FOR GENERATIVE REPLAY ###
-      if (gen_refresh_period and step % gen_refresh_period == 0 and
-          gen_every_n > 0):
+    ### 1) PERIODICALLY TAKE SNAPSHOTS FOR GENERATIVE REPLAY ###
+    if (gen_refresh_period and step % gen_refresh_period == 0 and
+        gen_every_n > 0):
 
-        # First, increment cumulative count and reset recent probs count.
-        cumulative_component_counts += recent_component_counts
-        recent_component_counts = np.zeros(n_y)
+      # First, increment cumulative count and reset recent probs count.
+      cumulative_component_counts += recent_component_counts
+      recent_component_counts = np.zeros(n_y)
 
-        # Generate enough samples for the rest of the next period
-        # (Functionally equivalent to storing and sampling from the model).
-        gen_buffer_images, gen_buffer_labels = get_generated_data(
-            sess=sess,
-            gen_op=gen_samples,
-            y_input=y_gen,
-            gen_buffer_size=gen_buffer_size,
-            component_counts=cumulative_component_counts)
+      # Generate enough samples for the rest of the next period
+      # (Functionally equivalent to storing and sampling from the model).
+      gen_buffer_images, gen_buffer_labels = get_generated_data(
+          sess=sess,
+          gen_op=gen_samples,
+          y_input=y_gen,
+          gen_buffer_size=gen_buffer_size,
+          component_counts=cumulative_component_counts)
 
-      ### 2) DECIDE WHICH DATA SOURCE TO USE (GENERATIVE OR REAL DATA) ###
-      periodic_refresh_started = (
-          gen_refresh_period and step >= gen_refresh_period)
-      refresh_on_expansion_started = (gen_refresh_on_expansion and has_expanded)
-      if ((periodic_refresh_started or refresh_on_expansion_started) and
-          gen_every_n > 0 and step % gen_every_n == 1):
-        # Use generated data for the training batch
-        used_real_data = False
+    ### 2) DECIDE WHICH DATA SOURCE TO USE (GENERATIVE OR REAL DATA) ###
+    periodic_refresh_started = (
+        gen_refresh_period and step >= gen_refresh_period)
+    refresh_on_expansion_started = (gen_refresh_on_expansion and has_expanded)
+    if ((periodic_refresh_started or refresh_on_expansion_started) and
+        gen_every_n > 0 and step % gen_every_n == 1):
+      # Use generated data for the training batch
+      used_real_data = False
 
-        s = gen_buffer_ind * batch_size
-        e = (gen_buffer_ind + 1) * batch_size
+      s = gen_buffer_ind * batch_size
+      e = (gen_buffer_ind + 1) * batch_size
 
-        gen_data_array = {
-            'image': gen_buffer_images[s:e],
-            'label': gen_buffer_labels[s:e]
+      gen_data_array = {
+          'image': gen_buffer_images[s:e],
+          'label': gen_buffer_labels[s:e]
+      }
+      gen_buffer_ind = (gen_buffer_ind + 1) % gen_buffer_size
+
+      # Feed it as x_train because it's already reshaped and binarized.
+      feed_dict.update({
+          x_train: gen_data_array['image'],
+          label_train: gen_data_array['label']
+      })
+
+      if use_supervised_replay:
+        # Convert label to one-hot before feeding in.
+        gen_label_onehot = np.eye(n_y)[gen_data_array['label']]
+        feed_dict.update({model_train.y_label: gen_label_onehot})
+        ops_to_run['train_step'] = train_step_supervised
+
+    else:
+      # Else use the standard training data sources.
+      used_real_data = True
+
+      # Select appropriate data source for iid or sequential setup.
+      if training_data_type == 'sequential':
+        current_data_period = int(
+            min(step / n_steps_per_class, len(train_data) - 1))
+
+        # If training supervised, set n_y_active directly based on how many
+        # classes have been seen
+        if train_supervised:
+          assert not dynamic_expansion
+          n_y_active_np = n_concurrent_classes * (
+              current_data_period // n_concurrent_classes +1)
+          n_y_active.load(n_y_active_np, sess)
+
+        train_data_array = sess.run(train_data[current_data_period])
+
+        # If we are blending classes, figure out where we are in the data
+        # period and add some fraction of other samples.
+        if blend_classes:
+          # If in the first quarter, blend in examples from the previous class
+          if (step % n_steps_per_class < n_steps_per_class / 4 and
+              current_data_period > 0):
+            other_train_data_array = sess.run(
+                train_data[current_data_period - 1])
+
+            num_other = int(
+                (n_steps_per_class / 2 - 2 *
+                  (step % n_steps_per_class)) * batch_size / n_steps_per_class)
+            other_inds = np.random.permutation(batch_size)[:num_other]
+
+            train_data_array[image_key][:num_other] = other_train_data_array[
+                image_key][other_inds]
+            train_data_array[label_key][:num_other] = other_train_data_array[
+                label_key][other_inds]
+
+          # If in the last quarter, blend in examples from the next class
+          elif (step % n_steps_per_class > 3 * n_steps_per_class / 4 and
+                current_data_period < n_classes - 1):
+            other_train_data_array = sess.run(train_data[current_data_period +
+                                                          1])
+
+            num_other = int(
+                (2 * (step % n_steps_per_class) - 3 * n_steps_per_class / 2) *
+                batch_size / n_steps_per_class)
+            other_inds = np.random.permutation(batch_size)[:num_other]
+
+            train_data_array[image_key][:num_other] = other_train_data_array[
+                image_key][other_inds]
+            train_data_array['label'][:num_other] = other_train_data_array[
+                label_key][other_inds]
+
+          # Otherwise, just use the current class
+
+      else:
+        train_data_array = sess.run(train_data)
+
+      feed_dict.update({
+          x_train_raw: train_data_array[image_key],
+          label_train: train_data_array[label_key]
+      })
+
+    ### 3) PERFORM A GRADIENT STEP ###
+    results = sess.run(ops_to_run, feed_dict=feed_dict)
+    del results['train_step']
+
+    ### 4) COMPUTE ADDITIONAL DIAGNOSTIC OPS ON VALIDATION/TEST SETS. ###
+    if (step+1) % report_interval == 0:
+      if valid_data is not None:
+        logging.info('Evaluating on validation and test set!')
+        proc_ops = {
+            k: (np.sum if 'confusion' in k
+                else np.mean) for k in valid_ops_to_run
         }
-        gen_buffer_ind = (gen_buffer_ind + 1) % gen_buffer_size
-
-        # Feed it as x_train because it's already reshaped and binarized.
-        feed_dict.update({
-            x_train: gen_data_array['image'],
-            label_train: gen_data_array['label']
-        })
-
-        if use_supervised_replay:
-          # Convert label to one-hot before feeding in.
-          gen_label_onehot = np.eye(n_y)[gen_data_array['label']]
-          feed_dict.update({model_train.y_label: gen_label_onehot})
-          ops_to_run['train_step'] = train_step_supervised
-
+        results.update(
+            process_dataset(
+                dataset_ops.valid_iter,
+                valid_ops_to_run,
+                sess,
+                feed_dict=feed_dict,
+                processing_ops=proc_ops))
+        results['valid_purity'] = compute_purity(results['valid_confusion'])
       else:
-        # Else use the standard training data sources.
-        used_real_data = True
+        logging.info('Evaluating on test set!')
+        proc_ops = {
+            k: (np.sum if 'confusion' in k
+                else np.mean) for k in test_ops_to_run
+        }
+      results.update(process_dataset(dataset_ops.test_iter,
+                                      test_ops_to_run,
+                                      sess,
+                                      feed_dict=feed_dict,
+                                      processing_ops=proc_ops))
+      results['test_purity'] = compute_purity(results['test_confusion'])
+      curr_to_log = to_log + to_log_eval
+    else:
+      curr_to_log = list(to_log)  # copy to prevent in-place modifications
 
-        # Select appropriate data source for iid or sequential setup.
-        if training_data_type == 'sequential':
-          current_data_period = int(
-              min(step / n_steps_per_class, len(train_data) - 1))
+    ### 5) DYNAMIC EXPANSION ###
+    if dynamic_expansion and used_real_data:
+      # If we're doing dynamic expansion and below max capacity then add
+      # poorly defined data points to a buffer.
 
-          # If training supervised, set n_y_active directly based on how many
-          # classes have been seen
-          if train_supervised:
-            assert not dynamic_expansion
-            n_y_active_np = n_concurrent_classes * (
-                current_data_period // n_concurrent_classes +1)
-            n_y_active.load(n_y_active_np, sess)
+      # First check whether the model is eligible for expansion (the model
+      # becomes ineligible for a fixed time after each expansion, and when
+      # it has hit max capacity).
+      if (steps_since_expansion >= exp_wait_steps and step >= exp_burn_in and
+          n_y_active_np < n_y):
+        eligible_for_expansion = True
 
-          train_data_array = sess.run(train_data[current_data_period])
+      steps_since_expansion += 1
 
-          # If we are blending classes, figure out where we are in the data
-          # period and add some fraction of other samples.
-          if blend_classes:
-            # If in the first quarter, blend in examples from the previous class
-            if (step % n_steps_per_class < n_steps_per_class / 4 and
-                current_data_period > 0):
-              other_train_data_array = sess.run(
-                  train_data[current_data_period - 1])
+      if eligible_for_expansion:
+        # Add poorly explained data samples to a buffer.
+        poor_inds = results['train_ll'] < ll_thresh
+        poor_data_buffer.extend(feed_dict[x_train_raw][poor_inds])
+        poor_data_labels.extend(feed_dict[label_train][poor_inds])
 
-              num_other = int(
-                  (n_steps_per_class / 2 - 2 *
-                   (step % n_steps_per_class)) * batch_size / n_steps_per_class)
-              other_inds = np.random.permutation(batch_size)[:num_other]
+        n_poor_data = len(poor_data_buffer)
 
-              train_data_array[image_key][:num_other] = other_train_data_array[
-                  image_key][other_inds]
-              train_data_array[label_key][:num_other] = other_train_data_array[
-                  label_key][other_inds]
+        # If buffer is big enough, then add a new component and train just the
+        # new component with several steps of gradient descent.
+        # (We just feed in a onehot cluster vector to indicate which
+        # component).
+        if n_poor_data >= exp_buffer_size:
+          # Dump the buffers so we can log them.
+          all_full_poor_data_buffers.append(poor_data_buffer)
+          all_full_poor_data_labels.append(poor_data_labels)
 
-            # If in the last quarter, blend in examples from the next class
-            elif (step % n_steps_per_class > 3 * n_steps_per_class / 4 and
-                  current_data_period < n_classes - 1):
-              other_train_data_array = sess.run(train_data[current_data_period +
-                                                           1])
+          # Take a new generative snapshot if specified.
+          if gen_refresh_on_expansion and gen_every_n > 0:
+            # Increment cumulative count and reset recent probs count.
+            cumulative_component_counts += recent_component_counts
+            recent_component_counts = np.zeros(n_y)
 
-              num_other = int(
-                  (2 * (step % n_steps_per_class) - 3 * n_steps_per_class / 2) *
-                  batch_size / n_steps_per_class)
-              other_inds = np.random.permutation(batch_size)[:num_other]
+            gen_buffer_images, gen_buffer_labels = get_generated_data(
+                sess=sess,
+                gen_op=gen_samples,
+                y_input=y_gen,
+                gen_buffer_size=gen_buffer_size,
+                component_counts=cumulative_component_counts)
 
-              train_data_array[image_key][:num_other] = other_train_data_array[
-                  image_key][other_inds]
-              train_data_array['label'][:num_other] = other_train_data_array[
-                  label_key][other_inds]
+          # Cull to a multiple of batch_size (keep the later data samples).
+          n_poor_batches = int(n_poor_data / batch_size)
+          poor_data_buffer = poor_data_buffer[-(n_poor_batches * batch_size):]
+          poor_data_labels = poor_data_labels[-(n_poor_batches * batch_size):]
 
-            # Otherwise, just use the current class
-
-        else:
-          train_data_array = sess.run(train_data)
-
-        feed_dict.update({
-            x_train_raw: train_data_array[image_key],
-            label_train: train_data_array[label_key]
-        })
-
-      ### 3) PERFORM A GRADIENT STEP ###
-      results = sess.run(ops_to_run, feed_dict=feed_dict)
-      del results['train_step']
-
-      ### 4) COMPUTE ADDITIONAL DIAGNOSTIC OPS ON VALIDATION/TEST SETS. ###
-      if (step+1) % report_interval == 0:
-        if valid_data is not None:
-          logging.info('Evaluating on validation and test set!')
-          proc_ops = {
-              k: (np.sum if 'confusion' in k
-                  else np.mean) for k in valid_ops_to_run
-          }
-          results.update(
-              process_dataset(
-                  dataset_ops.valid_iter,
-                  valid_ops_to_run,
-                  sess,
-                  feed_dict=feed_dict,
-                  processing_ops=proc_ops))
-          results['valid_purity'] = compute_purity(results['valid_confusion'])
-        else:
-          logging.info('Evaluating on test set!')
-          proc_ops = {
-              k: (np.sum if 'confusion' in k
-                  else np.mean) for k in test_ops_to_run
-          }
-        results.update(process_dataset(dataset_ops.test_iter,
-                                       test_ops_to_run,
-                                       sess,
-                                       feed_dict=feed_dict,
-                                       processing_ops=proc_ops))
-        results['test_purity'] = compute_purity(results['test_confusion'])
-        curr_to_log = to_log + to_log_eval
-      else:
-        curr_to_log = list(to_log)  # copy to prevent in-place modifications
-
-      ### 5) DYNAMIC EXPANSION ###
-      if dynamic_expansion and used_real_data:
-        # If we're doing dynamic expansion and below max capacity then add
-        # poorly defined data points to a buffer.
-
-        # First check whether the model is eligible for expansion (the model
-        # becomes ineligible for a fixed time after each expansion, and when
-        # it has hit max capacity).
-        if (steps_since_expansion >= exp_wait_steps and step >= exp_burn_in and
-            n_y_active_np < n_y):
-          eligible_for_expansion = True
-
-        steps_since_expansion += 1
-
-        if eligible_for_expansion:
-          # Add poorly explained data samples to a buffer.
-          poor_inds = results['train_ll'] < ll_thresh
-          poor_data_buffer.extend(feed_dict[x_train_raw][poor_inds])
-          poor_data_labels.extend(feed_dict[label_train][poor_inds])
-
-          n_poor_data = len(poor_data_buffer)
-
-          # If buffer is big enough, then add a new component and train just the
-          # new component with several steps of gradient descent.
-          # (We just feed in a onehot cluster vector to indicate which
-          # component).
-          if n_poor_data >= exp_buffer_size:
-            # Dump the buffers so we can log them.
-            all_full_poor_data_buffers.append(poor_data_buffer)
-            all_full_poor_data_labels.append(poor_data_labels)
-
-            # Take a new generative snapshot if specified.
-            if gen_refresh_on_expansion and gen_every_n > 0:
-              # Increment cumulative count and reset recent probs count.
-              cumulative_component_counts += recent_component_counts
-              recent_component_counts = np.zeros(n_y)
-
-              gen_buffer_images, gen_buffer_labels = get_generated_data(
-                  sess=sess,
-                  gen_op=gen_samples,
-                  y_input=y_gen,
-                  gen_buffer_size=gen_buffer_size,
-                  component_counts=cumulative_component_counts)
-
-            # Cull to a multiple of batch_size (keep the later data samples).
-            n_poor_batches = int(n_poor_data / batch_size)
-            poor_data_buffer = poor_data_buffer[-(n_poor_batches * batch_size):]
-            poor_data_labels = poor_data_labels[-(n_poor_batches * batch_size):]
-
-            # Find most probable component (on poor batch).
-            poor_cprobs = []
-            for bs in range(n_poor_batches):
-              poor_cprobs.append(
-                  sess.run(
-                      train_ops.cat_probs,
-                      feed_dict={
-                          x_train_raw:
-                              poor_data_buffer[bs * batch_size:(bs + 1) *
-                                               batch_size]
-                      }))
-            best_cluster = np.argmax(np.sum(np.vstack(poor_cprobs), axis=0))
-
-            # Initialize parameters of the new component from most prob
-            # existing.
-            new_cluster = n_y_active_np
-
-            copy_component_params(best_cluster, new_cluster, sess,
-                                  **dynamic_ops)
-
-            # Increment mixture component count n_y_active.
-            n_y_active_np += 1
-            n_y_active.load(n_y_active_np, sess)
-
-            # Perform a number of steps of gradient descent on the data buffer,
-            # training only the new component (supervised loss).
-            for _ in range(num_buffer_train_steps):
-              for bs in range(n_poor_batches):
-                x_batch = poor_data_buffer[bs * batch_size:(bs + 1) *
-                                           batch_size]
-                label_batch = [new_cluster] * batch_size
-                label_onehot_batch = np.eye(n_y)[label_batch]
-                _ = sess.run(
-                    train_step_expansion,
+          # Find most probable component (on poor batch).
+          poor_cprobs = []
+          for bs in range(n_poor_batches):
+            poor_cprobs.append(
+                sess.run(
+                    train_ops.cat_probs,
                     feed_dict={
-                        x_train_raw: x_batch,
-                        model_train.y_label: label_onehot_batch
-                    })
+                        x_train_raw:
+                            poor_data_buffer[bs * batch_size:(bs + 1) *
+                                              batch_size]
+                    }))
+          best_cluster = np.argmax(np.sum(np.vstack(poor_cprobs), axis=0))
 
-            # Empty the buffer.
-            poor_data_buffer = []
-            poor_data_labels = []
+          # Initialize parameters of the new component from most prob
+          # existing.
+          new_cluster = n_y_active_np
 
-            # Reset the threshold flag so we have a burn in before the next
-            # component.
-            eligible_for_expansion = False
-            has_expanded = True
-            steps_since_expansion = 0
+          copy_component_params(best_cluster, new_cluster, sess,
+                                **dynamic_ops)
 
-      # Accumulate counts.
-      if used_real_data:
-        train_cat_probs_vals = results['train_probs']
-        recent_component_counts += np.sum(
-            train_cat_probs_vals, axis=0).astype(float)
+          # Increment mixture component count n_y_active.
+          n_y_active_np += 1
+          n_y_active.load(n_y_active_np, sess)
 
-      ### 6) LOGGING AND EVALUATION ###
-      cleanup_for_print = lambda x: ', {}: %.{}f'.format(
-          x.capitalize().replace('_', ' '), 3)
-      log_str = 'Iteration %d'
-      log_str += ''.join([cleanup_for_print(el) for el in curr_to_log])
-      log_str += ' n_active: %d'
+          # Perform a number of steps of gradient descent on the data buffer,
+          # training only the new component (supervised loss).
+          for _ in range(num_buffer_train_steps):
+            for bs in range(n_poor_batches):
+              x_batch = poor_data_buffer[bs * batch_size:(bs + 1) *
+                                          batch_size]
+              label_batch = [new_cluster] * batch_size
+              label_onehot_batch = np.eye(n_y)[label_batch]
+              _ = sess.run(
+                  train_step_expansion,
+                  feed_dict={
+                      x_train_raw: x_batch,
+                      model_train.y_label: label_onehot_batch
+                  })
+
+          # Empty the buffer.
+          poor_data_buffer = []
+          poor_data_labels = []
+
+          # Reset the threshold flag so we have a burn in before the next
+          # component.
+          eligible_for_expansion = False
+          has_expanded = True
+          steps_since_expansion = 0
+
+    # Accumulate counts.
+    if used_real_data:
+      train_cat_probs_vals = results['train_probs']
+      recent_component_counts += np.sum(
+          train_cat_probs_vals, axis=0).astype(float)
+
+    ### 6) LOGGING AND EVALUATION ###
+    cleanup_for_print = lambda x: ', {}: %.{}f'.format(
+        x.capitalize().replace('_', ' '), 3)
+    log_str = 'Iteration %d'
+    log_str += ''.join([cleanup_for_print(el) for el in curr_to_log])
+    log_str += ' n_active: %d'
+    logging.info(
+        log_str,
+        *([step] + [results[el] for el in curr_to_log] + [n_y_active_np]))
+
+    # Periodically perform evaluation
+    if (step + 1) % report_interval == 0:
+
+      # Report test purity and related measures
       logging.info(
-          log_str,
-          *([step] + [results[el] for el in curr_to_log] + [n_y_active_np]))
+          'Iteration %d, Test purity: %.3f, Test ELBO: %.3f, Test '
+          'KLy: %.3f, Test KLz: %.3f', step, results['test_purity'],
+          results['test_ELBO'], results['test_kl_y'], results['test_kl_z'])
+      # Flush data only once in a while to allow buffering of data for more
+      # efficient writes.
+      results['all_full_poor_data_buffers'] = all_full_poor_data_buffers
+      results['all_full_poor_data_labels'] = all_full_poor_data_labels
+      logging.info('Also training a classifier in latent space')
 
-      # Periodically perform evaluation
-      if (step + 1) % report_interval == 0:
+      # Perform knn classification from latents, to evaluate discriminability.
 
-        # Report test purity and related measures
+      # Get and encode training and test datasets.
+      clf_train_vals = process_dataset(
+          dataset_ops.train_iter_for_clf, {
+              'latents': latents_for_clf,
+              'labels': train_data_for_clf[label_key]
+          },
+          sess,
+          feed_dict,
+          aggregation_ops=np.concatenate)
+      clf_test_vals = process_dataset(
+          dataset_ops.test_iter, {
+              'latents': test_ops.latents,
+              'labels': test_data[label_key]
+          },
+          sess,
+          aggregation_ops=np.concatenate)
+
+      # Perform knn classification.
+      knn_models = []
+      for nval in knn_values:
+        # Fit training dataset.
+        clf = neighbors.KNeighborsClassifier(n_neighbors=nval)
+        clf.fit(clf_train_vals['latents'], clf_train_vals['labels'])
+        knn_models.append(clf)
+
+        results['train_' + str(nval) + 'nn_acc'] = clf.score(
+            clf_train_vals['latents'], clf_train_vals['labels'])
+
+        # Get test performance.
+        results['test_' + str(nval) + 'nn_acc'] = clf.score(
+            clf_test_vals['latents'], clf_test_vals['labels'])
+
         logging.info(
-            'Iteration %d, Test purity: %.3f, Test ELBO: %.3f, Test '
-            'KLy: %.3f, Test KLz: %.3f', step, results['test_purity'],
-            results['test_ELBO'], results['test_kl_y'], results['test_kl_z'])
-        # Flush data only once in a while to allow buffering of data for more
-        # efficient writes.
-        results['all_full_poor_data_buffers'] = all_full_poor_data_buffers
-        results['all_full_poor_data_labels'] = all_full_poor_data_labels
-        logging.info('Also training a classifier in latent space')
-
-        # Perform knn classification from latents, to evaluate discriminability.
-
-        # Get and encode training and test datasets.
-        clf_train_vals = process_dataset(
-            dataset_ops.train_iter_for_clf, {
-                'latents': latents_for_clf,
-                'labels': train_data_for_clf[label_key]
-            },
-            sess,
-            feed_dict,
-            aggregation_ops=np.concatenate)
-        clf_test_vals = process_dataset(
-            dataset_ops.test_iter, {
-                'latents': test_ops.latents,
-                'labels': test_data[label_key]
-            },
-            sess,
-            aggregation_ops=np.concatenate)
-
-        # Perform knn classification.
-        knn_models = []
-        for nval in knn_values:
-          # Fit training dataset.
-          clf = neighbors.KNeighborsClassifier(n_neighbors=nval)
-          clf.fit(clf_train_vals['latents'], clf_train_vals['labels'])
-          knn_models.append(clf)
-
-          results['train_' + str(nval) + 'nn_acc'] = clf.score(
-              clf_train_vals['latents'], clf_train_vals['labels'])
-
-          # Get test performance.
-          results['test_' + str(nval) + 'nn_acc'] = clf.score(
-              clf_test_vals['latents'], clf_test_vals['labels'])
-
-          logging.info(
-              'Iteration %d %d-NN classifier accuracies, Training: '
-              '%.3f, Test: %.3f', step, nval,
-              results['train_' + str(nval) + 'nn_acc'],
-              results['test_' + str(nval) + 'nn_acc'])
+            'Iteration %d %d-NN classifier accuracies, Training: '
+            '%.3f, Test: %.3f', step, nval,
+            results['train_' + str(nval) + 'nn_acc'],
+            results['test_' + str(nval) + 'nn_acc'])

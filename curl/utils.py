@@ -20,28 +20,31 @@ from __future__ import division
 from __future__ import print_function
 
 from absl import logging
-import tensorflow.compat.v1 as tf
-import tensorflow_probability as tfp
+# import tensorflow.compat.v1 as tf
+# import tensorflow_probability as tfp
+import torch
+import torch.distributions as distributions
+import torch.nn.functional as F
 
 
 def generate_gaussian(logits, sigma_nonlin, sigma_param):
   """Generate a Gaussian distribution given a selected parameterisation."""
 
-  mu, sigma = tf.split(value=logits, num_or_size_splits=2, axis=1)
+  mu, sigma = torch.split(logits, split_size_or_sections=logits.size(1)//2, dim=1)
 
   if sigma_nonlin == 'exp':
-    sigma = tf.exp(sigma)
+    sigma = torch.exp(sigma)
   elif sigma_nonlin == 'softplus':
-    sigma = tf.nn.softplus(sigma)
+    sigma = torch.nn.Softplus(sigma)
   else:
     raise ValueError('Unknown sigma_nonlin {}'.format(sigma_nonlin))
 
   if sigma_param == 'var':
-    sigma = tf.sqrt(sigma)
+    sigma = torch.sqrt(sigma)
   elif sigma_param != 'std':
     raise ValueError('Unknown sigma_param {}'.format(sigma_param))
 
-  return tfp.distributions.Normal(loc=mu, scale=sigma)
+  return distributions.normal.Normal(loc=mu, scale=sigma)
 
 
 def construct_prior_probs(batch_size, n_y, n_y_active):
@@ -55,13 +58,14 @@ def construct_prior_probs(batch_size, n_y, n_y_active):
   Returns:
     Tensor representing the prior probability matrix, size of [batch_size, n_y].
   """
-  probs = tf.ones((batch_size, n_y_active)) / tf.cast(
-      n_y_active, dtype=tf.float32)
-  paddings1 = tf.stack([tf.constant(0), tf.constant(0)], axis=0)
-  paddings2 = tf.stack([tf.constant(0), n_y - n_y_active], axis=0)
-  paddings = tf.stack([paddings1, paddings2], axis=1)
-  probs = tf.pad(probs, paddings, constant_values=1e-12)
-  probs.set_shape((batch_size, n_y))
+
+  probs = torch.ones((batch_size, n_y_active)) / n_y_active
+  paddings1 = torch.tensor([0, 0])
+  paddings2 = torch.tensor([0, n_y - n_y_active])
+  paddings = torch.stack([paddings1, paddings2], dim=1)
+  probs = F.pad(probs, tuple(paddings.tolist()), value=1e-12)
+  probs = probs[:, :n_y]
+    
   logging.info('Prior shape: %s', str(probs.shape))
   return probs
 
