@@ -72,7 +72,7 @@ def construct_prior_probs(batch_size, n_y, n_y_active):
 
 def maybe_center_crop(layer, target_hw):
   """Center crop the layer to match a target shape."""
-  l_height, l_width = layer.shape.as_list()[1:3]
+  l_height, l_width = layer.shape.as_list()[2:4]
   t_height, t_width = target_hw
   assert t_height <= l_height and t_width <= l_width
 
@@ -85,5 +85,5 @@ def maybe_center_crop(layer, target_hw):
   x_0, x_1 = border, l_height - border
   border = int((l_width - t_width) / 2)
   y_0, y_1 = border, l_width - border
-  layer_cropped = layer[:, x_0:x_1, y_0:y_1, :]
+  layer_cropped = layer[:, :, x_0:x_1, y_0:y_1]
   return layer_cropped

@@ -188,3 +188,21 @@ class SharedConvModule(nn.Module):
 #     logging.info(h.shape.as_list())
 
 #     return h
+
+
+
+class CustomBatchNorm1d(nn.Module):
+    def __init__(self, num_features, test_local_stats=False, **kwargs):
+        super(CustomBatchNorm1d, self).__init__()
+        self.test_local_stats = test_local_stats
+        self.batch_norm_layer = nn.BatchNorm1d(num_features, **kwargs)
+
+    def forward(self, x):
+        if self.training or self.test_local_stats:
+            # Set the BatchNorm layer to training mode
+            self.batch_norm_layer.train()
+            return self.batch_norm_layer(x)
+        else:
+            # Set the BatchNorm layer to evaluation mode
+            self.batch_norm_layer.eval()
+            return self.batch_norm_layer(x)
